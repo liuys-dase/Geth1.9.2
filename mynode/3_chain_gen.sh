@@ -55,4 +55,4 @@ fi
 
 # 启动测试链
 echo "Starting the testchain..."
-$GETH_BINARY --datadir $DATA_DIR --networkid 200 --rpc --rpcapi "personal,eth,net,web3" --allow-insecure-unlock --nodiscover console
+$GETH_BINARY --datadir $DATA_DIR --networkid 200 --rpc --rpcapi "personal,eth,net,web3" --miner.threads=1 --miner.gastarget=0 --allow-insecure-unlock --nodiscover console
