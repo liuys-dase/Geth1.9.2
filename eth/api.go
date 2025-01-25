@@ -51,6 +51,21 @@ func NewPublicEthereumAPI(e *Ethereum) *PublicEthereumAPI {
 	return &PublicEthereumAPI{e}
 }
 
+// 新增：GetSenderBlocks 返回指定 sender 的区块号列表
+// func (api *PublicEthereumAPI) GetSenderBlocks(sender string) ([]uint64, error) {
+// 	// 将字符串转换为地址类型
+// 	address := common.HexToAddress(sender)
+
+// 	// 调用 BlockChain 方法获取 sender 对应的区块列表
+// 	blocks := api.e.BlockChain().GetBlocksBySender(address)
+
+// 	// 如果结果为空，返回错误提示
+// 	if blocks == nil {
+// 		return nil, fmt.Errorf("no blocks found for sender: %s", sender)
+// 	}
+// 	return blocks, nil
+// }
+
 // Etherbase is the address that mining rewards will be send to
 func (api *PublicEthereumAPI) Etherbase() (common.Address, error) {
 	return api.e.Etherbase()

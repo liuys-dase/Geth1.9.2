@@ -42,7 +42,7 @@ import (
 	"github.com/ethereum/go-ethereum/params"
 	"github.com/ethereum/go-ethereum/rlp"
 	"github.com/ethereum/go-ethereum/trie"
-	"github.com/hashicorp/golang-lru"
+	lru "github.com/hashicorp/golang-lru"
 )
 
 var (
@@ -172,6 +172,10 @@ type BlockChain struct {
 	badBlocks       *lru.Cache                     // Bad block cache
 	shouldPreserve  func(*types.Block) bool        // Function used to determine whether should preserve the given block.
 	terminateInsert func(common.Hash, uint64) bool // Testing hook used to terminate ancient receipt chain insertion.
+
+	// 新增：senderToBlockMap 用来存储每个地址对应的区块号（测试用）
+	senderToBlockMap map[common.Address][]uint64 // 添加 sender 到区块编号的映射
+	senderLock       sync.RWMutex                // 用于保护 senderToBlockMap 的读写锁
 }
 
 // NewBlockChain returns a fully initialised block chain using information
@@ -208,6 +212,9 @@ func NewBlockChain(db ethdb.Database, cacheConfig *CacheConfig, chainConfig *par
 		engine:         engine,
 		vmConfig:       vmConfig,
 		badBlocks:      badBlocks,
+		// 新增
+		senderToBlockMap: make(map[common.Address][]uint64), // 初始化映射表
+		senderLock:       sync.RWMutex{},                    // 初始化锁
 	}
 	bc.validator = NewBlockValidator(chainConfig, bc, engine)
 	bc.prefetcher = newStatePrefetcher(chainConfig, bc, engine)
@@ -283,6 +290,14 @@ func NewBlockChain(db ethdb.Database, cacheConfig *CacheConfig, chainConfig *par
 	// Take ownership of this particular state
 	go bc.update()
 	return bc, nil
+}
+
+// 新增：GetBlocksBySender 获取指定 sender 的区块编号列表
+func (bc *BlockChain) GetBlocksBySender(sender common.Address) []uint64 {
+	bc.senderLock.RLock()
+	defer bc.senderLock.RUnlock()
+
+	return bc.senderToBlockMap[sender]
 }
 
 func (bc *BlockChain) getProcInterrupt() bool {
@@ -1378,6 +1393,24 @@ func (bc *BlockChain) writeBlockWithState(block *types.Block, receipts []*types.
 		bc.insert(block)
 	}
 	bc.futureBlocks.Remove(block.Hash())
+
+	// 新增：遍历区块中的交易，更新 senderToBlockMap
+	for _, tx := range block.Transactions() {
+		sender, err := types.Sender(types.NewEIP155Signer(bc.chainConfig.ChainID), tx)
+		if err != nil {
+			log.Error("Failed to retrieve sender", "txHash", tx.Hash(), "err", err)
+			continue
+		}
+
+		blockNumber := block.NumberU64()
+
+		bc.senderLock.Lock()
+		bc.senderToBlockMap[sender] = append(bc.senderToBlockMap[sender], blockNumber)
+		bc.senderLock.Unlock()
+
+		log.Info("Mapped sender to block", "sender", sender.Hex(), "blockNumber", blockNumber)
+	}
+
 	return status, nil
 }
 

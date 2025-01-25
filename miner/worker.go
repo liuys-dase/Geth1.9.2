@@ -548,71 +548,88 @@ func (w *worker) taskLoop() {
 func (w *worker) resultLoop() {
 	for {
 		select {
+		// 从结果通道中接收已封装的区块
 		case block := <-w.resultCh:
-			// Short circuit when receiving empty result.
+			// 如果接收到的结果为空，跳过本次循环
 			if block == nil {
 				continue
 			}
-			// Short circuit when receiving duplicate result caused by resubmitting.
+			// 如果区块链中已经存在该区块（重复结果），跳过本次循环
 			if w.chain.HasBlock(block.Hash(), block.NumberU64()) {
 				continue
 			}
 			var (
-				sealhash = w.engine.SealHash(block.Header())
-				hash     = block.Hash()
+				sealhash = w.engine.SealHash(block.Header()) // 获取区块的 SealHash（共识相关的哈希）
+				hash     = block.Hash()                      // 获取区块的实际哈希值
 			)
+
+			// 从待处理任务列表中获取对应的任务信息
 			w.pendingMu.RLock()
 			task, exist := w.pendingTasks[sealhash]
 			w.pendingMu.RUnlock()
 			if !exist {
+				// 如果没有找到对应的任务，记录错误并跳过
 				log.Error("Block found but no relative pending task", "number", block.Number(), "sealhash", sealhash, "hash", hash)
 				continue
 			}
-			// Different block could share same sealhash, deep copy here to prevent write-write conflict.
+
+			// 防止任务之间写入冲突，对区块接收和日志进行深拷贝
 			var (
-				receipts = make([]*types.Receipt, len(task.receipts))
-				logs     []*types.Log
+				receipts = make([]*types.Receipt, len(task.receipts)) // 拷贝交易收据列表
+				logs     []*types.Log                                 // 存储日志列表
 			)
 			for i, receipt := range task.receipts {
-				// add block location fields
+				// 更新收据的区块相关字段
 				receipt.BlockHash = hash
 				receipt.BlockNumber = block.Number()
 				receipt.TransactionIndex = uint(i)
 
+				// 深拷贝收据信息
 				receipts[i] = new(types.Receipt)
 				*receipts[i] = *receipt
-				// Update the block hash in all logs since it is now available and not when the
-				// receipt/log of individual transactions were created.
+
+				// 更新日志的区块哈希
 				for _, log := range receipt.Logs {
 					log.BlockHash = hash
 				}
+				// 将日志添加到日志列表中
 				logs = append(logs, receipt.Logs...)
 			}
-			// Commit block and state to database.
+
+			// 将区块和状态写入区块链数据库
 			stat, err := w.chain.WriteBlockWithState(block, receipts, task.state)
 			if err != nil {
+				// 如果写入失败，记录错误并跳过
 				log.Error("Failed writing block to chain", "err", err)
 				continue
 			}
-			log.Info("Successfully sealed new block", "number", block.Number(), "sealhash", sealhash, "hash", hash,
-				"elapsed", common.PrettyDuration(time.Since(task.createdAt)))
 
-			// Broadcast the block and announce chain insertion event
+			// 打印成功生成区块的日志信息
+			log.Info("Successfully sealed new block",
+				"number", block.Number(), // 区块高度
+				"sealhash", sealhash, // SealHash
+				"hash", hash, // 区块哈希
+				"elapsed", common.PrettyDuration(time.Since(task.createdAt))) // 生成所用时间
+
+			// 广播新生成的区块，并触发链的插入事件
 			w.mux.Post(core.NewMinedBlockEvent{Block: block})
 
 			var events []interface{}
+			// 根据区块链状态更新相关事件
 			switch stat {
-			case core.CanonStatTy:
-				events = append(events, core.ChainEvent{Block: block, Hash: block.Hash(), Logs: logs})
-				events = append(events, core.ChainHeadEvent{Block: block})
-			case core.SideStatTy:
-				events = append(events, core.ChainSideEvent{Block: block})
+			case core.CanonStatTy: // 如果是主链上的区块
+				events = append(events, core.ChainEvent{Block: block, Hash: block.Hash(), Logs: logs}) // 链事件
+				events = append(events, core.ChainHeadEvent{Block: block})                             // 链头事件
+			case core.SideStatTy: // 如果是侧链上的区块
+				events = append(events, core.ChainSideEvent{Block: block}) // 侧链事件
 			}
+			// 发布事件到区块链
 			w.chain.PostChainEvents(events, logs)
 
-			// Insert the block into the set of pending ones to resultLoop for confirmations
+			// 将区块插入待确认的未确认区块集合中
 			w.unconfirmed.Insert(block.NumberU64(), block.Hash())
 
+		// 如果退出通道有消息，退出循环
 		case <-w.exitCh:
 			return
 		}
@@ -830,78 +847,89 @@ func (w *worker) commitTransactions(txs *types.TransactionsByPriceAndNonce, coin
 
 // commitNewWork generates several new sealing tasks based on the parent block.
 func (w *worker) commitNewWork(interrupt *int32, noempty bool, timestamp int64) {
+	// 加锁，确保读取当前工作状态时不会被其他线程修改
 	w.mu.RLock()
 	defer w.mu.RUnlock()
 
-	tstart := time.Now()
-	parent := w.chain.CurrentBlock()
+	tstart := time.Now()             // 记录当前时间
+	parent := w.chain.CurrentBlock() // 获取当前链的最新区块
 
+	// 确保新的区块的时间戳大于父区块的时间戳
 	if parent.Time() >= uint64(timestamp) {
 		timestamp = int64(parent.Time() + 1)
 	}
-	// this will ensure we're not going off too far in the future
+	// 如果时间戳过于超前（超过当前时间1秒以上），则等待一段时间再进行挖矿
 	if now := time.Now().Unix(); timestamp > now+1 {
 		wait := time.Duration(timestamp-now) * time.Second
 		log.Info("Mining too far in the future", "wait", common.PrettyDuration(wait))
 		time.Sleep(wait)
 	}
 
+	// 创建新区块的头信息
 	num := parent.Number()
 	header := &types.Header{
-		ParentHash: parent.Hash(),
-		Number:     num.Add(num, common.Big1),
-		GasLimit:   core.CalcGasLimit(parent, w.config.GasFloor, w.config.GasCeil),
-		Extra:      w.extra,
-		Time:       uint64(timestamp),
+		ParentHash: parent.Hash(),                                                  // 父区块的哈希值
+		Number:     num.Add(num, common.Big1),                                      // 当前区块的编号（父区块编号 + 1）
+		GasLimit:   core.CalcGasLimit(parent, w.config.GasFloor, w.config.GasCeil), // 计算当前区块的Gas限制
+		Extra:      w.extra,                                                        // 额外信息
+		Time:       uint64(timestamp),                                              // 当前时间戳
 	}
-	// Only set the coinbase if our consensus engine is running (avoid spurious block rewards)
+
+	// 如果共识引擎正在运行，则设置区块的coinbase地址（矿工奖励地址）
 	if w.isRunning() {
 		if w.coinbase == (common.Address{}) {
-			log.Error("Refusing to mine without etherbase")
+			log.Error("Refusing to mine without etherbase") // 如果未设置矿工地址，打印错误日志并退出
 			return
 		}
-		header.Coinbase = w.coinbase
+		header.Coinbase = w.coinbase // 设置coinbase地址
 	}
+
+	// 调用共识引擎的 Prepare 方法，初始化区块头信息
 	if err := w.engine.Prepare(w.chain, header); err != nil {
 		log.Error("Failed to prepare header for mining", "err", err)
 		return
 	}
-	// If we are care about TheDAO hard-fork check whether to override the extra-data or not
+
+	// 检查是否需要处理 TheDAO 硬分叉
 	if daoBlock := w.chainConfig.DAOForkBlock; daoBlock != nil {
-		// Check whether the block is among the fork extra-override range
+		// 判断当前区块是否在硬分叉范围内
 		limit := new(big.Int).Add(daoBlock, params.DAOForkExtraRange)
 		if header.Number.Cmp(daoBlock) >= 0 && header.Number.Cmp(limit) < 0 {
-			// Depending whether we support or oppose the fork, override differently
+			// 根据是否支持硬分叉，修改区块头的Extra数据
 			if w.chainConfig.DAOForkSupport {
 				header.Extra = common.CopyBytes(params.DAOForkBlockExtra)
 			} else if bytes.Equal(header.Extra, params.DAOForkBlockExtra) {
-				header.Extra = []byte{} // If miner opposes, don't let it use the reserved extra-data
+				header.Extra = []byte{} // 如果反对硬分叉，则清空保留的Extra数据
 			}
 		}
 	}
-	// Could potentially happen if starting to mine in an odd state.
+
+	// 创建当前挖矿任务的上下文环境
 	err := w.makeCurrent(parent, header)
 	if err != nil {
 		log.Error("Failed to create mining context", "err", err)
 		return
 	}
-	// Create the current work task and check any fork transitions needed
+
+	// 处理硬分叉相关状态变更
 	env := w.current
 	if w.chainConfig.DAOForkSupport && w.chainConfig.DAOForkBlock != nil && w.chainConfig.DAOForkBlock.Cmp(header.Number) == 0 {
-		misc.ApplyDAOHardFork(env.state)
+		misc.ApplyDAOHardFork(env.state) // 应用硬分叉相关的状态变更
 	}
-	// Accumulate the uncles for the current block
+
+	// 收集叔块（uncles）
 	uncles := make([]*types.Header, 0, 2)
 	commitUncles := func(blocks map[common.Hash]*types.Block) {
-		// Clean up stale uncle blocks first
+		// 清理过期的叔块
 		for hash, uncle := range blocks {
 			if uncle.NumberU64()+staleThreshold <= header.Number.Uint64() {
 				delete(blocks, hash)
 			}
 		}
+		// 添加有效的叔块
 		for hash, uncle := range blocks {
 			if len(uncles) == 2 {
-				break
+				break // 每个区块最多包含2个叔块
 			}
 			if err := w.commitUncle(env, uncle.Header()); err != nil {
 				log.Trace("Possible uncle rejected", "hash", hash, "reason", err)
@@ -911,28 +939,28 @@ func (w *worker) commitNewWork(interrupt *int32, noempty bool, timestamp int64) 
 			}
 		}
 	}
-	// Prefer to locally generated uncle
+	// 优先使用本地生成的叔块
 	commitUncles(w.localUncles)
 	commitUncles(w.remoteUncles)
 
+	// 如果允许创建空块，提前提交一个空块（未包含交易）
 	if !noempty {
-		// Create an empty block based on temporary copied state for sealing in advance without waiting block
-		// execution finished.
 		w.commit(uncles, nil, false, tstart)
 	}
 
-	// Fill the block with all available pending transactions.
+	// 从交易池中获取所有待处理的交易
 	pending, err := w.eth.TxPool().Pending()
 	if err != nil {
 		log.Error("Failed to fetch pending transactions", "err", err)
 		return
 	}
-	// Short circuit if there is no available pending transactions
+	// 如果没有可用交易，直接更新快照并退出
 	if len(pending) == 0 {
 		w.updateSnapshot()
 		return
 	}
-	// Split the pending transactions into locals and remotes
+
+	// 将交易分为本地交易和远程交易
 	localTxs, remoteTxs := make(map[common.Address]types.Transactions), pending
 	for _, account := range w.eth.TxPool().Locals() {
 		if txs := remoteTxs[account]; len(txs) > 0 {
@@ -940,18 +968,24 @@ func (w *worker) commitNewWork(interrupt *int32, noempty bool, timestamp int64) 
 			localTxs[account] = txs
 		}
 	}
+
+	// 优先处理本地交易
 	if len(localTxs) > 0 {
 		txs := types.NewTransactionsByPriceAndNonce(w.current.signer, localTxs)
 		if w.commitTransactions(txs, w.coinbase, interrupt) {
 			return
 		}
 	}
+
+	// 处理远程交易
 	if len(remoteTxs) > 0 {
 		txs := types.NewTransactionsByPriceAndNonce(w.current.signer, remoteTxs)
 		if w.commitTransactions(txs, w.coinbase, interrupt) {
 			return
 		}
 	}
+
+	// 最终提交区块，包含所有交易和叔块
 	w.commit(uncles, w.fullTaskHook, true, tstart)
 }
 
