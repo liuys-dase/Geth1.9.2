@@ -1,0 +1,3 @@
+eth.getBalance("0xa54e66fe6f9edfd63098dec6ba96da2a16a4609f")
+eth.accounts
+eth.coinbase
